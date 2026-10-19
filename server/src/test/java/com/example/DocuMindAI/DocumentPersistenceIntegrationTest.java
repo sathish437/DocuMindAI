@@ -297,4 +297,53 @@ class DocumentPersistenceIntegrationTest {
         assertEquals(2, multiDocEvidence.size());
         assertTrue(documentService.hasSufficientEvidence(multiDocEvidence));
     }
+
+    @Test
+    @DisplayName("GET /api/documents should return empty list when no documents are uploaded")
+    void testGetAllDocumentsEmptyWhenNoDocuments() throws Exception {
+        mockMvc.perform(get("/api/documents"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(0)));
+
+        // Trailing slash support
+        mockMvc.perform(get("/api/documents/"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(0)));
+    }
+
+    @Test
+    @DisplayName("GET /api/documents should return persisted metadata sorted newest first without exposing raw segments")
+    void testGetAllDocumentsReturnsPersistedMetadataSortedNewestFirst() throws Exception {
+        byte[] docA = TestDocumentFactory.createPdf(List.of("Content for document A."));
+        byte[] docB = TestDocumentFactory.createPdf(List.of("Content for document B."));
+
+        MockMultipartFile fileA = new MockMultipartFile("files", "first_doc.pdf", MediaType.APPLICATION_PDF_VALUE, docA);
+        MockMultipartFile fileB = new MockMultipartFile("files", "second_doc.pdf", MediaType.APPLICATION_PDF_VALUE, docB);
+
+        mockMvc.perform(multipart("/api/documents/upload").file(fileA)).andExpect(status().isOk());
+        // Slight pause to guarantee distinct timestamps
+        Thread.sleep(20);
+        mockMvc.perform(multipart("/api/documents/upload").file(fileB)).andExpect(status().isOk());
+
+        // Verify GET /api/documents returns newest upload first
+        mockMvc.perform(get("/api/documents"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(2)))
+                .andExpect(jsonPath("$[0].fileName", is("second_doc.pdf")))
+                .andExpect(jsonPath("$[0].documentType", is("PDF")))
+                .andExpect(jsonPath("$[0].status", is("PROCESSED")))
+                .andExpect(jsonPath("$[0].id", notNullValue()))
+                .andExpect(jsonPath("$[0].size", notNullValue()))
+                .andExpect(jsonPath("$[0].uploadTimestamp", notNullValue()))
+                .andExpect(jsonPath("$[0].pageCount", is(1)))
+                .andExpect(jsonPath("$[0].totalSegments", is(0)))
+                .andExpect(jsonPath("$[0].segments", hasSize(0)))
+                .andExpect(jsonPath("$[1].fileName", is("first_doc.pdf")));
+
+        // Verify GET /api/documents/ with trailing slash works identically
+        mockMvc.perform(get("/api/documents/"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(2)))
+                .andExpect(jsonPath("$[0].fileName", is("second_doc.pdf")));
+    }
 }

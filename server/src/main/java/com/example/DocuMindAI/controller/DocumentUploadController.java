@@ -77,7 +77,7 @@ public class DocumentUploadController {
                     description = "List of all persisted documents retrieved successfully"
             )
     })
-    @GetMapping
+    @GetMapping({"", "/"})
     public ResponseEntity<List<DocumentMetadataResponse>> getAllDocuments() {
         return ResponseEntity.ok(documentService.getAllDocuments());
     }
