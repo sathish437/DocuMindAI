@@ -1,0 +1,19 @@
+# Environment files and credentials
+.env
+.env.*
+.env.local
+!.env.example
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE and Editor directories
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+logs/

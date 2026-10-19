@@ -134,6 +134,16 @@ public class DocumentService {
     // =========================================================================
 
     /**
+     * Retrieves all uploaded document metadata records ordered by upload timestamp descending.
+     */
+    @Transactional(readOnly = true)
+    public List<DocumentMetadataResponse> getAllDocuments() {
+        return documentRepository.findAllByOrderByUploadTimestampDesc().stream()
+                .map(this::mapToSummaryResponse)
+                .toList();
+    }
+
+    /**
      * Internal retrieval of complete document with its segments.
      */
     @Transactional(readOnly = true)
@@ -148,6 +158,9 @@ public class DocumentService {
      */
     @Transactional
     public void deleteDocument(UUID id) {
+        if (id == null) {
+            throw new IllegalArgumentException("Document ID must not be null.");
+        }
         Document document = documentRepository.findById(id)
                 .orElseThrow(() -> new DocumentNotFoundException(id));
         documentVectorService.deleteDocumentVectors(id);
@@ -216,6 +229,28 @@ public class DocumentService {
                 seg.getHeading(),
                 seg.getSegmentOrder(),
                 seg.getText()
+        );
+    }
+
+    private DocumentMetadataResponse mapToSummaryResponse(Document document) {
+        String mimeType = "DOCX".equalsIgnoreCase(document.getDocumentType())
+                ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                : "application/pdf";
+
+        return new DocumentMetadataResponse(
+                document.getId(),
+                document.getFileName(),
+                document.getDocumentType(),
+                document.getFileSize(),
+                mimeType,
+                document.getStatus(),
+                document.getUploadTimestamp(),
+                document.isOcrRequired(),
+                document.getOcrMessage(),
+                document.getPageCount(),
+                document.getParagraphCount(),
+                0,
+                List.of()
         );
     }
 

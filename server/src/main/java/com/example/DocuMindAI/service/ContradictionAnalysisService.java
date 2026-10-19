@@ -404,8 +404,8 @@ public class ContradictionAnalysisService {
             addSourceFromClaim(f.claimB(), uniqueSources);
         }
 
-        // Add any remaining fallback sources
-        if (fallbackSources != null) {
+        // Add any remaining fallback sources ONLY IF no verified claim sources were found
+        if (uniqueSources.isEmpty() && fallbackSources != null) {
             for (SourceReferenceResponse s : fallbackSources) {
                 String key = (s.documentName() != null ? s.documentName() : "") + ":" + s.pageNumber() + ":" + s.paragraphIndex();
                 uniqueSources.putIfAbsent(key, s);

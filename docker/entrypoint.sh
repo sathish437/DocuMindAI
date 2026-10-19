@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -e
+
+# Render provides the PORT environment variable (typically 10000)
+# Default to 10000 if not set, or 80 for standard HTTP
+PORT="${PORT:-10000}"
+echo "[DocuMindAI] Initializing container with public PORT=${PORT}..."
+
+# Replace __PORT__ placeholder in nginx.conf with the actual assigned port
+sed -i "s/__PORT__/${PORT}/g" /etc/nginx/nginx.conf
+
+# Ensure required runtime directories exist
+mkdir -p /run/nginx /var/log/nginx /usr/share/nginx/html
+
+# Start Spring Boot backend in background on internal port 8080 (loopback only)
+echo "[DocuMindAI] Starting Spring Boot backend on 127.0.0.1:8080..."
+java ${JAVA_TOOL_OPTIONS:-"-XX:+UseContainerSupport -XX:MaxRAMPercentage=65.0 -XX:+TieredCompilation -XX:TieredStopAtLevel=1"} \
+     -jar /app/app.jar \
+     --server.port=8080 \
+     --server.address=127.0.0.1 &
+BACKEND_PID=$!
+
+# Start Nginx in background listening on assigned public PORT
+echo "[DocuMindAI] Starting Nginx on port ${PORT}..."
+nginx -g "daemon off;" &
+NGINX_PID=$!
+
+# Signal handler for graceful shutdown on SIGTERM / SIGINT
+cleanup() {
+    echo "[DocuMindAI] Received termination signal. Initiating graceful shutdown..."
+    kill -TERM "$BACKEND_PID" 2>/dev/null || true
+    kill -QUIT "$NGINX_PID" 2>/dev/null || true
+    wait "$BACKEND_PID" 2>/dev/null || true
+    wait "$NGINX_PID" 2>/dev/null || true
+    echo "[DocuMindAI] All services stopped."
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# Monitor both processes: if either process terminates, shut down cleanly
+while kill -0 "$BACKEND_PID" 2>/dev/null && kill -0 "$NGINX_PID" 2>/dev/null; do
+    sleep 2
+done
+
+echo "[DocuMindAI] A service exited unexpectedly. Shutting down container."
+cleanup

@@ -1,0 +1,19 @@
+.git
+.gitignore
+.dockerignore
+.env
+.env.*
+.env.local
+!.env.example
+.vscode
+.idea
+*.log
+
+# Build artifacts and local dependencies
+server/target/
+**/target/
+client/dist/
+client/dist-ssr/
+**/dist/
+client/node_modules/
+**/node_modules/

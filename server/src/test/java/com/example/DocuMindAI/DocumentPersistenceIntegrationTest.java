@@ -159,24 +159,53 @@ class DocumentPersistenceIntegrationTest {
     // =========================================================================
 
     @Test
-    @DisplayName("Should verify that public GET /api/documents listing endpoint is no longer exposed")
-    void testPublicGetDocumentsEndpointIsRemoved() throws Exception {
+    @DisplayName("Should retrieve all persisted documents via GET /api/documents")
+    void testGetAllDocumentsReturnsPersistedDocuments() throws Exception {
+        byte[] pdfBytes = TestDocumentFactory.createPdf(List.of("Persisted document content"));
+        MockMultipartFile file = new MockMultipartFile("files", "persisted_doc.pdf", MediaType.APPLICATION_PDF_VALUE, pdfBytes);
+        mockMvc.perform(multipart("/api/documents/upload").file(file)).andExpect(status().isOk());
+
         mockMvc.perform(get("/api/documents"))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(1)))
+                .andExpect(jsonPath("$[0].fileName", is("persisted_doc.pdf")))
+                .andExpect(jsonPath("$[0].status", is("PROCESSED")));
     }
 
     @Test
-    @DisplayName("Should verify that public GET /api/documents/{id} endpoint is no longer exposed")
-    void testPublicGetDocumentByIdEndpointIsRemoved() throws Exception {
+    @DisplayName("Should verify that public GET /api/documents/{id} endpoint is not allowed")
+    void testPublicGetDocumentByIdEndpointIsNotAllowed() throws Exception {
         mockMvc.perform(get("/api/documents/" + UUID.randomUUID()))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isMethodNotAllowed());
     }
 
     @Test
-    @DisplayName("Should verify that public DELETE /api/documents/{id} endpoint is no longer exposed")
-    void testPublicDeleteDocumentEndpointIsRemoved() throws Exception {
+    @DisplayName("Should return 404 when attempting to delete non-existent document ID")
+    void testDeleteNonExistentDocumentReturnsNotFound() throws Exception {
         mockMvc.perform(delete("/api/documents/" + UUID.randomUUID()))
                 .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("Should successfully remove document and cascaded segments by ID")
+    void testDeleteDocumentByIdSuccess() throws Exception {
+        byte[] pdfBytes = TestDocumentFactory.createPdf(List.of("Document to be removed."));
+        MockMultipartFile file = new MockMultipartFile("files", "to_delete.pdf", MediaType.APPLICATION_PDF_VALUE, pdfBytes);
+
+        MvcResult result = mockMvc.perform(multipart("/api/documents/upload").file(file))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String docIdStr = JsonPath.read(result.getResponse().getContentAsString(), "$.files[0].id");
+        UUID docId = UUID.fromString(docIdStr);
+
+        mockMvc.perform(delete("/api/documents/" + docId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message", containsString("removed successfully")))
+                .andExpect(jsonPath("$.documentId", is(docId.toString())));
+
+        assertEquals(0, documentRepository.count());
+        assertEquals(0, segmentRepository.count());
     }
 
     // =========================================================================

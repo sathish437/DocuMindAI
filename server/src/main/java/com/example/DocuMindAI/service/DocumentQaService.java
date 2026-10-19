@@ -541,37 +541,78 @@ public class DocumentQaService {
             List<UUID> targetedDocIds
     ) {}
 
+    private String stripDocExtension(String fileName) {
+        if (fileName == null) return "";
+        return fileName.replaceAll("(?i)\\.(pdf|docx)$", "").trim();
+    }
+
+    private boolean isWordOrPhraseMatch(String text, String phrase) {
+        if (text == null || phrase == null || phrase.isBlank()) return false;
+        String escaped = Pattern.quote(phrase);
+        Pattern p = Pattern.compile("(?i)(?:^|\\s|[\\p{Punct}&&[^_]])" + escaped + "(?:$|\\s|[\\p{Punct}&&[^_]])");
+        return p.matcher(text).find() || text.contains(phrase);
+    }
+
     private ExplicitDocumentCheck checkExplicitNamedDocument(String question) {
         if (question == null || question.isBlank()) {
             return new ExplicitDocumentCheck(false, null, null);
         }
 
-        Matcher matcher = EXPLICIT_DOC_PATTERN.matcher(question);
-        List<String> mentionedFiles = new ArrayList<>();
-        while (matcher.find()) {
-            mentionedFiles.add(matcher.group(1));
-        }
-
-        if (mentionedFiles.isEmpty()) {
+        List<Document> allDocs = documentRepository.findAll();
+        if (allDocs.isEmpty()) {
             return new ExplicitDocumentCheck(false, null, null);
         }
 
-        List<Document> allDocs = documentRepository.findAll();
-        Map<String, Document> docsByName = allDocs.stream()
-                .filter(d -> d.getFileName() != null)
-                .collect(Collectors.toMap(
-                        d -> d.getFileName().toLowerCase(Locale.ROOT),
-                        d -> d,
-                        (existing, replacement) -> existing
-                ));
+        String questionLower = question.toLowerCase(Locale.ROOT);
+
+        // Sort documents by filename length descending so longer/more specific names match first
+        List<Document> sortedDocs = allDocs.stream()
+                .filter(d -> d.getFileName() != null && !d.getFileName().isBlank())
+                .sorted((d1, d2) -> Integer.compare(d2.getFileName().length(), d1.getFileName().length()))
+                .toList();
 
         List<UUID> targetedIds = new ArrayList<>();
-        for (String fileName : mentionedFiles) {
-            String lower = fileName.toLowerCase(Locale.ROOT);
-            if (docsByName.containsKey(lower)) {
-                targetedIds.add(docsByName.get(lower).getId());
-            } else {
-                return new ExplicitDocumentCheck(true, fileName, null);
+        Set<UUID> addedDocIds = new HashSet<>();
+        List<String> matchedDocNames = new ArrayList<>();
+
+        for (Document doc : sortedDocs) {
+            String fileName = doc.getFileName();
+            String lowerFileName = fileName.toLowerCase(Locale.ROOT);
+            String baseName = stripDocExtension(fileName).toLowerCase(Locale.ROOT);
+
+            boolean matched = false;
+            if (questionLower.contains(lowerFileName)) {
+                matched = true;
+            } else if (baseName.length() >= 4 && isWordOrPhraseMatch(questionLower, baseName)) {
+                matched = true;
+            }
+
+            if (matched && addedDocIds.add(doc.getId())) {
+                targetedIds.add(doc.getId());
+                matchedDocNames.add(fileName);
+            }
+        }
+
+        // Check if question explicitly requests a .pdf or .docx file that does NOT exist in the database
+        Pattern explicitExtPattern = Pattern.compile("(?i)(?:['\"]([a-zA-Z0-9_\\-\\.\\s]{2,100}?\\.(?:pdf|docx))['\"]|\\b([a-zA-Z0-9_\\-\\.]+\\.(?:pdf|docx))\\b)");
+        Matcher matcher = explicitExtPattern.matcher(question);
+        while (matcher.find()) {
+            String candidateFile = matcher.group(1) != null ? matcher.group(1).trim() : matcher.group(2).trim();
+            String lowerCandidate = candidateFile.toLowerCase(Locale.ROOT);
+            boolean exists = sortedDocs.stream()
+                    .anyMatch(d -> {
+                        String df = d.getFileName().toLowerCase(Locale.ROOT);
+                        return df.equals(lowerCandidate) || df.endsWith(lowerCandidate);
+                    });
+            if (!exists) {
+                boolean matchesAnyExisting = matchedDocNames.stream()
+                        .anyMatch(name -> {
+                            String ln = name.toLowerCase(Locale.ROOT);
+                            return ln.contains(lowerCandidate) || lowerCandidate.contains(ln);
+                        });
+                if (!matchesAnyExisting) {
+                    return new ExplicitDocumentCheck(true, candidateFile, null);
+                }
             }
         }
 
@@ -648,7 +689,7 @@ public class DocumentQaService {
         // 5. Detect insufficient evidence in answer & map citations (including internal contradiction processing)
         long startCitation = System.currentTimeMillis();
         String answer;
-        List<SourceReferenceResponse> sources = contextBundle.sourceReferences();
+        List<SourceReferenceResponse> sources;
         boolean insufficient;
 
         if (contradictionAnalysisService != null && contradictionAnalysisService.isStructuredJson(rawAnswer)) {
@@ -659,9 +700,21 @@ public class DocumentQaService {
             answer = contradictionAnalysisService.formatFindingsAsAnswer(verifiedResponse, language);
             sources = contradictionAnalysisService.mapFindingsToSources(verifiedResponse, contextBundle.sourceReferences());
             insufficient = verifiedResponse.insufficientEvidence() || isInsufficientEvidence(answer);
+            if (insufficient) {
+                sources = List.of();
+            }
         } else {
             answer = rawAnswer;
             insufficient = isInsufficientEvidence(answer);
+            if (insufficient) {
+                sources = List.of();
+            } else {
+                sources = verifyAndFilterSources(answer, question, contextBundle, targetedDocIds, intent, language);
+                if (sources.isEmpty()) {
+                    insufficient = true;
+                    answer = getInsufficientEvidenceMessage(language);
+                }
+            }
         }
         long citationElapsed = System.currentTimeMillis() - startCitation;
         long totalElapsed = System.currentTimeMillis() - startTotal;
@@ -677,6 +730,380 @@ public class DocumentQaService {
                 insufficient
         );
     }
+
+    private record VerifiedSourceCandidate(
+            SourceReferenceResponse source,
+            double score,
+            String docName,
+            Integer pageNumber,
+            Integer paragraphIndex
+    ) {}
+
+    /**
+     * Verifies and filters retrieved candidate chunks against the generated answer.
+     * Ensures every returned citation directly supports factual claims made in the answer,
+     * exists in the original extracted document text in the database, and is deduplicated.
+     */
+    public List<SourceReferenceResponse> verifyAndFilterSources(
+            String answer,
+            String question,
+            ContextBundle contextBundle,
+            List<UUID> targetedDocIds,
+            QuestionIntent intent,
+            QueryLanguage language) {
+
+        if (answer == null || answer.isBlank() || isInsufficientEvidence(answer)) {
+            return List.of();
+        }
+
+        if (contextBundle == null || contextBundle.sourceReferences() == null || contextBundle.sourceReferences().isEmpty()) {
+            return List.of();
+        }
+
+        List<SourceReferenceResponse> candidateSources = contextBundle.sourceReferences();
+
+        // 1. If explicit documents were targeted, immediately exclude any chunk from non-targeted documents
+        if (targetedDocIds != null && !targetedDocIds.isEmpty()) {
+            Set<UUID> targetSet = new HashSet<>(targetedDocIds);
+            candidateSources = candidateSources.stream()
+                    .filter(s -> s.documentId() != null && targetSet.contains(s.documentId()))
+                    .toList();
+        }
+
+        if (candidateSources.isEmpty()) {
+            return List.of();
+        }
+
+        // 2. Fetch database segments to verify against original extracted document text (Requirement 7)
+        Set<UUID> docIdsInCandidates = candidateSources.stream()
+                .map(SourceReferenceResponse::documentId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        List<DocumentSegment> dbSegments = docIdsInCandidates.isEmpty()
+                ? List.of()
+                : segmentRepository.findByDocumentIdsWithDocument(new ArrayList<>(docIdsInCandidates));
+
+        Map<UUID, List<DocumentSegment>> dbSegmentsByDocId = dbSegments.stream()
+                .filter(s -> s.getDocument() != null && s.getDocument().getId() != null)
+                .collect(Collectors.groupingBy(s -> s.getDocument().getId()));
+
+        String normalizedAnswer = answer.toLowerCase(Locale.ROOT);
+        Set<String> answerTokens = extractSignificantTokens(answer);
+        List<String> answerPhrases = extractSignificantPhrases(answer, 3);
+
+        List<VerifiedSourceCandidate> verifiedCandidates = new ArrayList<>();
+
+        for (SourceReferenceResponse candidate : candidateSources) {
+            UUID docId = candidate.documentId();
+            String docName = candidate.documentName() != null ? candidate.documentName() : "";
+            String lowerDocName = docName.toLowerCase(Locale.ROOT);
+            String citation = candidate.citation() != null ? candidate.citation().toLowerCase(Locale.ROOT) : "";
+
+            // Check if chunk exists in original extracted document text in database
+            List<DocumentSegment> docDbSegments = (docId != null) ? dbSegmentsByDocId.getOrDefault(docId, List.of()) : List.of();
+            DocumentSegment matchingDbSegment = findMatchingDbSegment(candidate, docDbSegments);
+            if (!docDbSegments.isEmpty() && matchingDbSegment == null) {
+                // Not found in original DB segments -> cannot be verified
+                continue;
+            }
+
+            String fullText = matchingDbSegment != null ? matchingDbSegment.getText() : candidate.excerpt();
+            if (fullText == null || fullText.isBlank()) {
+                continue;
+            }
+
+            // Check whether this candidate directly supports factual statements in the answer
+            double supportScore = computeFactualSupportScore(
+                    candidate, fullText, normalizedAnswer, answerTokens, answerPhrases, lowerDocName, citation
+            );
+
+            // In comparison questions, preserve candidate resumes being evaluated even if the LLM only named the winner
+            if (supportScore <= 0.0 && (intent == QuestionIntent.COMPARISON || intent == QuestionIntent.COMBINED)) {
+                if (isResumeOrCandidateQuestion(question)) {
+                    boolean isResume = lowerDocName.contains("resume") || lowerDocName.contains("cv")
+                            || lowerDocName.contains("bio") || lowerDocName.contains("profile")
+                            || hasKeyResumeKeywords(fullText);
+                    if (isResume) {
+                        supportScore = 1.0;
+                    }
+                }
+            }
+
+            // If score is above support threshold, it directly supports the answer
+            if (supportScore > 0.0) {
+                // Build exact verified excerpt grounded in the original document text
+                String verifiedExcerpt = extractSupportingExcerpt(fullText, answerTokens, answerPhrases, MAX_EXCERPT_LENGTH);
+                if (verifiedExcerpt == null || verifiedExcerpt.isBlank()) {
+                    verifiedExcerpt = candidate.excerpt();
+                }
+
+                // Verify excerpt against original document text
+                if (matchingDbSegment != null && !isTextGroundedInOriginal(verifiedExcerpt, matchingDbSegment.getText())) {
+                    continue;
+                }
+
+                verifiedCandidates.add(new VerifiedSourceCandidate(
+                        new SourceReferenceResponse(
+                                candidate.documentId(),
+                                candidate.documentName(),
+                                candidate.documentType(),
+                                candidate.segmentType(),
+                                candidate.pageNumber(),
+                                candidate.paragraphIndex(),
+                                candidate.heading(),
+                                candidate.citation(),
+                                verifiedExcerpt
+                        ),
+                        supportScore,
+                        docName,
+                        candidate.pageNumber(),
+                        candidate.paragraphIndex()
+                ));
+            }
+        }
+
+        if (verifiedCandidates.isEmpty()) {
+            return List.of();
+        }
+
+        // 3. Deduplicate repeated citations (Requirement 8)
+        Map<String, VerifiedSourceCandidate> bestByLocator = new LinkedHashMap<>();
+        for (VerifiedSourceCandidate vc : verifiedCandidates) {
+            String locatorKey = vc.docName().toLowerCase(Locale.ROOT)
+                    + "::p:" + vc.pageNumber()
+                    + "::para:" + vc.paragraphIndex();
+
+            VerifiedSourceCandidate existing = bestByLocator.get(locatorKey);
+            if (existing == null || vc.score() > existing.score()) {
+                bestByLocator.put(locatorKey, vc);
+            }
+        }
+
+        // 4. Preserve cross-document coverage when the question genuinely asks to compare multiple documents (Requirement 12)
+        List<SourceReferenceResponse> finalSources = new ArrayList<>();
+        if (intent == QuestionIntent.COMPARISON || intent == QuestionIntent.COMBINED || intent == QuestionIntent.CONTRADICTION) {
+            Map<String, List<VerifiedSourceCandidate>> byDoc = bestByLocator.values().stream()
+                    .collect(Collectors.groupingBy(v -> v.docName().toLowerCase(Locale.ROOT), LinkedHashMap::new, Collectors.toList()));
+
+            for (List<VerifiedSourceCandidate> docSources : byDoc.values()) {
+                docSources.sort(Comparator.comparingDouble(VerifiedSourceCandidate::score).reversed());
+                for (VerifiedSourceCandidate s : docSources) {
+                    finalSources.add(s.source());
+                }
+            }
+        } else {
+            List<VerifiedSourceCandidate> sorted = new ArrayList<>(bestByLocator.values());
+            sorted.sort(Comparator.comparingDouble(VerifiedSourceCandidate::score).reversed());
+            for (VerifiedSourceCandidate s : sorted) {
+                finalSources.add(s.source());
+            }
+        }
+
+        return finalSources;
+    }
+
+    private double computeFactualSupportScore(
+            SourceReferenceResponse candidate,
+            String fullText,
+            String normalizedAnswer,
+            Set<String> answerTokens,
+            List<String> answerPhrases,
+            String lowerDocName,
+            String citation) {
+
+        double score = 0.0;
+        String lowerChunk = fullText.toLowerCase(Locale.ROOT);
+
+        // 1. Explicit citation reference check in answer
+        String baseDocName = stripDocExtension(lowerDocName);
+        if (!citation.isBlank() && normalizedAnswer.contains(citation)) {
+            score += 10.0;
+        } else if (!lowerDocName.isBlank() && (normalizedAnswer.contains(lowerDocName) || (!baseDocName.isBlank() && normalizedAnswer.contains(baseDocName)))) {
+            score += 5.0;
+            if (candidate.pageNumber() != null && normalizedAnswer.contains("page " + candidate.pageNumber())) {
+                score += 5.0;
+            } else if (candidate.paragraphIndex() != null && normalizedAnswer.contains("para " + candidate.paragraphIndex())) {
+                score += 5.0;
+            }
+        } else if (!baseDocName.isBlank()) {
+            String[] parts = baseDocName.split("[_\\-\\s]+");
+            for (String part : parts) {
+                if (part.length() > 2 && !STOP_WORDS.contains(part) && !part.equals("resume") && !part.equals("document") && !part.equals("policy")) {
+                    if (normalizedAnswer.contains(part)) {
+                        score += 5.0;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. Phrase overlap (2+ or 3+ words)
+        int matchingPhrases = 0;
+        for (String phrase : answerPhrases) {
+            if (lowerChunk.contains(phrase)) {
+                matchingPhrases++;
+            }
+        }
+        score += (matchingPhrases * 2.5);
+
+        // 3. Number, date, currency, and code factual entity overlap
+        List<String> numbersInAnswer = extractNumbersAndEntities(normalizedAnswer);
+        int matchingEntities = 0;
+        for (String num : numbersInAnswer) {
+            if (lowerChunk.contains(num)) {
+                matchingEntities++;
+            }
+        }
+        score += (matchingEntities * 2.0);
+
+        // 4. Keyword token overlap
+        Set<String> chunkTokens = extractSignificantTokens(fullText);
+        long sharedTokens = chunkTokens.stream().filter(answerTokens::contains).count();
+
+        if (sharedTokens >= 3) {
+            score += (sharedTokens * 0.5);
+        }
+
+        // Negative Filtering: If no phrase matches, no entity matches, and fewer than 3 shared keywords,
+        // this chunk does not support the answer.
+        if (matchingPhrases == 0 && matchingEntities == 0 && sharedTokens < 3 && score < 5.0) {
+            return 0.0;
+        }
+
+        return score;
+    }
+
+    private List<String> extractNumbersAndEntities(String text) {
+        if (text == null || text.isBlank()) return List.of();
+        List<String> entities = new ArrayList<>();
+        Matcher m = Pattern.compile("\\b(\\d+(?:[.,]\\d+)?%?|[$€₹£]\\d+|\\d+\\s*(?:million|billion|lakh|crore|days|hours|months|years|percent|inr|usd))\\b")
+                .matcher(text.toLowerCase(Locale.ROOT));
+        while (m.find()) {
+            entities.add(m.group().trim());
+        }
+        return entities;
+    }
+
+    private Set<String> extractSignificantTokens(String text) {
+        if (text == null || text.isBlank()) return Set.of();
+        return Arrays.stream(WORD_SPLIT_UNICODE.split(text.toLowerCase(Locale.ROOT)))
+                .map(String::trim)
+                .filter(w -> !w.isBlank()
+                        && w.length() > 2
+                        && !STOP_WORDS.contains(w)
+                        && !TANGLISH_STOP_AND_MARKER_WORDS.contains(w))
+                .collect(Collectors.toSet());
+    }
+
+    private List<String> extractSignificantPhrases(String text, int phraseLength) {
+        if (text == null || text.isBlank()) return List.of();
+        String[] words = WORD_SPLIT_UNICODE.split(text.toLowerCase(Locale.ROOT));
+        List<String> cleanWords = Arrays.stream(words)
+                .map(String::trim)
+                .filter(w -> !w.isBlank() && !STOP_WORDS.contains(w))
+                .toList();
+
+        if (cleanWords.size() < phraseLength) {
+            return List.of();
+        }
+
+        List<String> phrases = new ArrayList<>();
+        for (int i = 0; i <= cleanWords.size() - phraseLength; i++) {
+            StringBuilder sb = new StringBuilder();
+            for (int j = 0; j < phraseLength; j++) {
+                if (j > 0) sb.append(" ");
+                sb.append(cleanWords.get(i + j));
+            }
+            phrases.add(sb.toString());
+        }
+        return phrases;
+    }
+
+    private DocumentSegment findMatchingDbSegment(SourceReferenceResponse candidate, List<DocumentSegment> docDbSegments) {
+        if (docDbSegments == null || docDbSegments.isEmpty()) {
+            return null;
+        }
+
+        // Try matching by exact pageNumber or paragraphIndex
+        for (DocumentSegment seg : docDbSegments) {
+            if (candidate.pageNumber() != null && Objects.equals(candidate.pageNumber(), seg.getPageNumber())) {
+                return seg;
+            }
+            if (candidate.paragraphIndex() != null && Objects.equals(candidate.paragraphIndex(), seg.getParagraphIndex())) {
+                return seg;
+            }
+        }
+
+        // If locator not matched, match by excerpt substring
+        String normExcerpt = normalizeTextForComparison(candidate.excerpt(), 100);
+        for (DocumentSegment seg : docDbSegments) {
+            if (normalizeTextForComparison(seg.getText(), 100).contains(normExcerpt)
+                    || normExcerpt.contains(normalizeTextForComparison(seg.getText(), 100))) {
+                return seg;
+            }
+        }
+
+        return docDbSegments.get(0);
+    }
+
+    private String extractSupportingExcerpt(String fullText, Set<String> answerTokens, List<String> answerPhrases, int maxLength) {
+        if (fullText == null || fullText.isBlank()) return "";
+        String clean = fullText.replaceAll("\\s+", " ").trim();
+        if (clean.length() <= maxLength) {
+            return clean;
+        }
+
+        // Split text into sentences and find sentence with highest match to answer
+        String[] sentences = clean.split("(?<=[.!?])\\s+");
+        String bestSentence = sentences[0];
+        int maxMatches = -1;
+
+        for (String sent : sentences) {
+            String lower = sent.toLowerCase(Locale.ROOT);
+            int matches = 0;
+            for (String phrase : answerPhrases) {
+                if (lower.contains(phrase)) matches += 3;
+            }
+            for (String tok : answerTokens) {
+                if (lower.contains(tok)) matches += 1;
+            }
+            if (matches > maxMatches) {
+                maxMatches = matches;
+                bestSentence = sent;
+            }
+        }
+
+        int idx = clean.indexOf(bestSentence);
+        if (idx < 0) {
+            return clean.substring(0, Math.min(clean.length(), maxLength)) + "...";
+        }
+
+        int start = Math.max(0, idx - 30);
+        int end = Math.min(clean.length(), start + maxLength);
+        String prefix = start > 0 ? "..." : "";
+        String suffix = end < clean.length() ? "..." : "";
+        return prefix + clean.substring(start, end).trim() + suffix;
+    }
+
+    private boolean isTextGroundedInOriginal(String excerpt, String originalText) {
+        if (excerpt == null || originalText == null) return false;
+        String cleanExcerpt = excerpt.replace("...", "").replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
+        if (cleanExcerpt.isBlank()) return true;
+        String cleanOriginal = originalText.replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
+        return cleanOriginal.contains(cleanExcerpt)
+                || cleanExcerpt.contains(cleanOriginal)
+                || computeTokenOverlapRatio(cleanExcerpt, cleanOriginal) >= 0.6;
+    }
+
+    private double computeTokenOverlapRatio(String textA, String textB) {
+        Set<String> tokensA = extractSignificantTokens(textA);
+        if (tokensA.isEmpty()) return 1.0;
+        Set<String> tokensB = extractSignificantTokens(textB);
+        long common = tokensA.stream().filter(tokensB::contains).count();
+        return (double) common / tokensA.size();
+    }
+
 
     public ChatResponse invokeChatModelWithRetry(Prompt prompt, QuestionIntent intent) {
         long backoffMs = INITIAL_AI_BACKOFF_MS;
