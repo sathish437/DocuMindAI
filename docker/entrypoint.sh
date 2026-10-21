@@ -20,6 +20,20 @@ java ${JAVA_TOOL_OPTIONS:-"-XX:+UseContainerSupport -XX:MaxRAMPercentage=65.0 -X
      --server.address=127.0.0.1 &
 BACKEND_PID=$!
 
+# Wait for Spring Boot to be healthy before exposing public traffic via Nginx
+echo "[DocuMindAI] Waiting for Spring Boot backend to become ready..."
+for i in $(seq 1 60); do
+    if wget -q -O - http://127.0.0.1:8080/actuator/health 2>/dev/null | grep -q "UP"; then
+        echo "[DocuMindAI] Backend is healthy and ready to accept requests (elapsed ${i}s)."
+        break
+    fi
+    if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+        echo "[DocuMindAI] FATAL: Spring Boot backend failed to start and exited unexpectedly."
+        exit 1
+    fi
+    sleep 1
+done
+
 # Start Nginx in background listening on assigned public PORT
 echo "[DocuMindAI] Starting Nginx on port ${PORT}..."
 nginx -g "daemon off;" &
