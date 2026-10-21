@@ -6,10 +6,10 @@ import {
   CloseIcon,
   UploadCloudIcon,
   CheckIcon,
-  SidebarIcon,
   TrashIcon,
   SpinnerIcon,
-  ExclamationIcon
+  ExclamationIcon,
+  RefreshIcon
 } from './Icons';
 import { formatFileSize } from '../api/apiClient';
 
@@ -18,6 +18,7 @@ export function Sidebar({
   onClose,
   uploadedDocuments = [],
   isLoadingDocuments = false,
+  isRetryingDocuments = false,
   documentFetchError = null,
   onRetryFetchDocuments = null,
   onNewChat,
@@ -99,25 +100,52 @@ export function Sidebar({
           </div>
 
           <div className="sidebar-docs-list">
-            {isLoadingDocuments ? (
+            {uploadedDocuments.length > 0 && documentFetchError && (
+              <div className="sidebar-stale-warning animate-fade-in" role="status">
+                <ExclamationIcon size={13} className="stale-warning-icon" />
+                <span className="stale-warning-text">Server offline • Showing cached docs</span>
+                {onRetryFetchDocuments && (
+                  <button
+                    type="button"
+                    className="stale-retry-btn"
+                    onClick={onRetryFetchDocuments}
+                    disabled={isLoadingDocuments || isRetryingDocuments}
+                    title="Retry connecting to server"
+                    aria-label="Retry connection"
+                  >
+                    <RefreshIcon size={12} className={(isLoadingDocuments || isRetryingDocuments) ? 'animate-spin' : ''} />
+                  </button>
+                )}
+              </div>
+            )}
+
+            {isLoadingDocuments && uploadedDocuments.length === 0 ? (
               <div className="sidebar-loading-docs" role="status" aria-label="Loading documents">
                 <SpinnerIcon size={18} />
-                <span>Loading documents...</span>
+                <span>{isRetryingDocuments ? 'Connecting to server...' : 'Loading documents...'}</span>
               </div>
             ) : documentFetchError && uploadedDocuments.length === 0 ? (
               <div className="sidebar-empty-docs sidebar-error-docs" role="alert">
                 <div className="empty-docs-icon-box error-tint">
                   <ExclamationIcon size={20} />
                 </div>
-                <p className="empty-docs-title">Could not load documents</p>
+                <p className="empty-docs-title">Server Temporarily Unavailable</p>
                 <p className="empty-docs-desc">{documentFetchError}</p>
                 {onRetryFetchDocuments && (
                   <button
                     type="button"
-                    className="empty-docs-upload-btn"
+                    className="empty-docs-upload-btn retry-btn"
                     onClick={onRetryFetchDocuments}
+                    disabled={isLoadingDocuments || isRetryingDocuments}
                   >
-                    Retry
+                    {(isLoadingDocuments || isRetryingDocuments) ? (
+                      <>
+                        <SpinnerIcon size={14} />
+                        <span>Reconnecting...</span>
+                      </>
+                    ) : (
+                      'Retry'
+                    )}
                   </button>
                 )}
               </div>

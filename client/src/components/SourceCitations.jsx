@@ -2,11 +2,11 @@ import React, { useState } from 'react';
 import { PdfIcon, DocxIcon, FileTextIcon, ChevronDownIcon, ChevronUpIcon } from './Icons';
 
 export function SourceCitations({ sources, activeDocumentNames }) {
-  if (!sources || sources.length === 0) return null;
-
-  // Keep full source list collapsed by default when appropriate (Requirement 9)
+  // Keep full source list collapsed by default when appropriate
   // Single source remains visible by default; multiple sources are collapsed to keep answers readable
-  const [isOpen, setIsOpen] = useState(sources.length === 1);
+  const [isOpen, setIsOpen] = useState(sources?.length === 1);
+
+  if (!sources || sources.length === 0) return null;
 
   return (
     <div className="citations-container" aria-label="Verified document sources">
@@ -46,7 +46,7 @@ export function SourceCitations({ sources, activeDocumentNames }) {
   );
 }
 
-function SourceCard({ source, index, activeDocumentNames }) {
+function SourceCard({ source, activeDocumentNames }) {
   const [expanded, setExpanded] = useState(false);
 
   const isDocx = source.documentType === 'DOCX' || (source.documentName && source.documentName.toLowerCase().endsWith('.docx'));

@@ -5,7 +5,7 @@
  *  - POST /api/documents/ask (application/json, body: { question })
  */
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
+const API_BASE = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL) || '';
 
 export const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB per file limit
 export const MAX_FILE_COUNT = 10; // Max 10 files per upload batch
@@ -112,17 +112,53 @@ export async function askQuestion(question) {
 
 /**
  * Retrieve all persisted documents from the database.
+ * Includes timeout protection and graceful handling of 502/503/504/network errors.
+ * @param {Object} [options]
+ * @param {AbortSignal} [options.signal] - Caller abort signal for cancellation on unmount
+ * @param {number} [options.timeoutMs=15000] - Request timeout in milliseconds
  * @returns {Promise<Array>} List of document metadata objects
  */
-export async function getDocuments() {
+export async function getDocuments({ signal, timeoutMs = 15000 } = {}) {
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort('timeout');
+  }, timeoutMs);
+
+  // Link caller signal if provided
+  if (signal) {
+    if (signal.aborted) {
+      clearTimeout(timeoutId);
+      const abortErr = new Error('Request aborted');
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
+    signal.addEventListener(
+      'abort',
+      () => {
+        controller.abort(signal.reason);
+      },
+      { once: true }
+    );
+  }
+
   try {
-    const response = await fetch(`${API_BASE}/api/documents`);
+    const response = await fetch(`${API_BASE}/api/documents`, {
+      signal: controller.signal
+    });
     const data = await response.json().catch(() => null);
 
     if (!response.ok) {
-      const errorMsg = data?.message || data?.error || `Failed to fetch documents (HTTP ${response.status})`;
-      const err = new Error(errorMsg);
+      const isUnavailable = [502, 503, 504].includes(response.status);
+      const friendlyMsg = isUnavailable
+        ? 'The server is temporarily unavailable. Your documents will appear when the connection is restored.'
+        : (data?.message || data?.error || `Failed to fetch documents (HTTP ${response.status})`);
+
+      const err = new Error(friendlyMsg);
       err.status = response.status;
+      err.isServerUnavailable = isUnavailable;
       err.details = data;
       throw err;
     }
@@ -141,9 +177,23 @@ export async function getDocuments() {
     }));
   } catch (err) {
     if (err.status) throw err;
-    const netErr = new Error(err.message || 'Network error: Unable to load documents from server.');
+    if (timedOut) {
+      const timeoutErr = new Error('The server is temporarily unavailable. Your documents will appear when the connection is restored.');
+      timeoutErr.status = 504;
+      timeoutErr.isTimeout = true;
+      timeoutErr.isServerUnavailable = true;
+      throw timeoutErr;
+    }
+    if (err.name === 'AbortError') {
+      throw err;
+    }
+    const netErr = new Error('The server is temporarily unavailable. Your documents will appear when the connection is restored.');
     netErr.isNetworkError = true;
+    netErr.isServerUnavailable = true;
+    netErr.status = 0;
     throw netErr;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 

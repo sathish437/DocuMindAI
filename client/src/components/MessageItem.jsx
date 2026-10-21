@@ -9,10 +9,11 @@ import {
   DocxIcon,
   FileTextIcon,
   ExclamationIcon,
-  RefreshIcon
+  RefreshIcon,
+  EditIcon
 } from './Icons';
 
-export function MessageItem({ message, onRetry, activeDocumentNames }) {
+export function MessageItem({ message, onRetry, onEdit, isGenerating, activeDocumentNames }) {
   const [copied, setCopied] = useState(false);
 
   const isUser = message.sender === 'user' || message.role === 'user';
@@ -70,11 +71,31 @@ export function MessageItem({ message, onRetry, activeDocumentNames }) {
             <div className="user-text-content">{textContent}</div>
           </div>
 
-          {formattedTime && (
-            <div className="message-meta-actions">
+          <div className="message-meta-actions">
+            {message.isEdited && (
+              <span className="message-edited-badge" title="This message was edited">
+                (edited)
+              </span>
+            )}
+
+            {onEdit && (
+              <button
+                type="button"
+                className="message-action-btn edit-btn"
+                onClick={() => onEdit(message)}
+                disabled={isGenerating}
+                title="Edit and resend this question"
+                aria-label="Edit question"
+              >
+                <EditIcon size={12} />
+                <span>Edit</span>
+              </button>
+            )}
+
+            {formattedTime && (
               <span className="message-timestamp">{formattedTime}</span>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
     );

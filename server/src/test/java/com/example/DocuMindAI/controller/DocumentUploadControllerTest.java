@@ -19,6 +19,8 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -192,4 +194,35 @@ class DocumentUploadControllerTest {
                 .andExpect(jsonPath("$.error", is("Unprocessable Entity")))
                 .andExpect(jsonPath("$.message", containsString("Failed to extract content from PDF 'corrupt.pdf'")));
     }
+
+    @Test
+    @DisplayName("Should return HTTP 200 with an empty list when no documents are persisted")
+    void testGetAllDocumentsEmpty() throws Exception {
+        mockMvc.perform(get("/api/documents"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(0)));
+    }
+
+    @Test
+    @DisplayName("Should return HTTP 200 with documents after successful upload")
+    void testGetAllDocumentsPopulated() throws Exception {
+        byte[] pdfContent = TestDocumentFactory.createPdf(List.of("Test document text"));
+        MockMultipartFile file = new MockMultipartFile(
+                "files",
+                "test-doc.pdf",
+                MediaType.APPLICATION_PDF_VALUE,
+                pdfContent
+        );
+
+        mockMvc.perform(multipart("/api/documents/upload").file(file))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(get("/api/documents"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(1)))
+                .andExpect(jsonPath("$[0].fileName", is("test-doc.pdf")))
+                .andExpect(jsonPath("$[0].documentType", is("PDF")))
+                .andExpect(jsonPath("$[0].status", is("PROCESSED")));
+    }
 }
+

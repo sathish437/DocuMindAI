@@ -103,7 +103,7 @@ function renderInline(text) {
   // 1: Bold `**bold**`
   // 2: Inline code `code`
   // 3: Source citations `[filename.pdf, Page X]`
-  const tokenRegex = /(\*\*[^*]+\*\*|`[^`]+`|\[[a-zA-Z0-9_\-\.\s]+,\s*(?:Page|Para)\s*\d+[^\]]*\])/g;
+  const tokenRegex = /(\*\*[^*]+\*\*|`[^`]+`|\[[a-zA-Z0-9_\-.\s]+,\s*(?:Page|Para)\s*\d+[^\]]*\])/g;
 
   const parts = text.split(tokenRegex);
 

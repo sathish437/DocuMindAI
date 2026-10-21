@@ -7,6 +7,7 @@ export function MessageList({
   messages,
   isGenerating,
   onRetry,
+  onEdit,
   onSelectSuggestion,
   hasDocuments,
   activeDocumentNames
@@ -53,6 +54,8 @@ export function MessageList({
             key={msg.id || index}
             message={msg}
             onRetry={onRetry}
+            onEdit={onEdit}
+            isGenerating={isGenerating}
             activeDocumentNames={activeDocumentNames}
           />
         ))}

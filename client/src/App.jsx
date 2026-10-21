@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import Header from './components/Header';
 import Sidebar from './components/Sidebar';
 import MessageList from './components/MessageList';
@@ -9,6 +9,8 @@ import { CheckIcon, CloseIcon, ExclamationIcon } from './components/Icons';
 import { getDocuments, uploadDocuments, askQuestion, deleteDocument } from './api/apiClient';
 import './App.css';
 
+const MAX_DOCUMENT_RETRIES = 3;
+
 export function App() {
   // Chat messages
   const [messages, setMessages] = useState([]);
@@ -16,8 +18,20 @@ export function App() {
   // Track documents indexed in the database
   const [uploadedDocuments, setUploadedDocuments] = useState([]);
   const [isLoadingDocuments, setIsLoadingDocuments] = useState(true);
+  const [isRetryingDocuments, setIsRetryingDocuments] = useState(false);
   const [documentFetchError, setDocumentFetchError] = useState(null);
   
+  // Message currently being edited
+  const [editingMessage, setEditingMessage] = useState(null);
+  const savedDraftRef = useRef('');
+
+  // Retry, timeout, and cancellation refs
+  const abortControllerRef = useRef(null);
+  const retryTimeoutRef = useRef(null);
+  const retryCountRef = useRef(0);
+  const isMountedRef = useRef(true);
+  const loadDocumentsRef = useRef(null);
+
   // Pending attachments currently selected in the composer
   const [pendingAttachments, setPendingAttachments] = useState([]);
   
@@ -62,14 +76,40 @@ export function App() {
     return () => clearTimeout(timer);
   }, []);
 
-  // Fetch persisted documents from database on initial page load and refresh
-  const loadDocuments = useCallback(async () => {
-    setIsLoadingDocuments(true);
-    setDocumentFetchError(null);
+  // Fetch persisted documents from database with bounded exponential retry and abort cancellation
+  const loadDocuments = useCallback(async (isManualRetry = false) => {
+    // Clear any active retry timer to prevent race conditions
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
+    }
+
+    // Cancel in-flight request if manual retry or resetting
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    if (isManualRetry) {
+      retryCountRef.current = 0;
+      setIsLoadingDocuments(true);
+      setIsRetryingDocuments(false);
+      setDocumentFetchError(null);
+    } else if (retryCountRef.current === 0) {
+      setIsLoadingDocuments(true);
+      setDocumentFetchError(null);
+    } else {
+      setIsRetryingDocuments(true);
+    }
+
     try {
-      const docs = await getDocuments();
+      const docs = await getDocuments({ signal: controller.signal });
+      if (!isMountedRef.current) return;
+
       setUploadedDocuments((prev) => {
-        // Merge by document ID to avoid duplicates if an upload response overlaps
+        // Merge by document ID to avoid duplicates
         const map = new Map();
         docs.forEach((d) => {
           if (d.id) map.set(d.id, d);
@@ -81,16 +121,52 @@ export function App() {
         });
         return Array.from(map.values());
       });
+
+      setDocumentFetchError(null);
+      retryCountRef.current = 0;
+      setIsRetryingDocuments(false);
     } catch (err) {
-      console.error('Failed to load initial documents from database:', err);
-      setDocumentFetchError(err.message || 'Failed to load documents from database.');
+      if (!isMountedRef.current || err.name === 'AbortError') return;
+
+      const friendlyMsg = err.message || 'The server is temporarily unavailable. Your documents will appear when the connection is restored.';
+      setDocumentFetchError(friendlyMsg);
+
+      // Bounded automatic retry with exponential backoff
+      if (retryCountRef.current < MAX_DOCUMENT_RETRIES) {
+        retryCountRef.current += 1;
+        const delay = 1500 * Math.pow(2, retryCountRef.current - 1); // 1.5s, 3s, 6s
+        setIsRetryingDocuments(true);
+        retryTimeoutRef.current = setTimeout(() => {
+          if (isMountedRef.current && loadDocumentsRef.current) {
+            loadDocumentsRef.current(false);
+          }
+        }, delay);
+      } else {
+        setIsRetryingDocuments(false);
+      }
     } finally {
-      setIsLoadingDocuments(false);
+      if (isMountedRef.current) {
+        setIsLoadingDocuments(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    loadDocuments();
+    loadDocumentsRef.current = loadDocuments;
+  }, [loadDocuments]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    loadDocuments(false);
+    return () => {
+      isMountedRef.current = false;
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
   }, [loadDocuments]);
 
   // Responsive resize handler for sidebar
@@ -239,8 +315,96 @@ export function App() {
     await executeUpload([target]);
   };
 
+  // Start editing a user message
+  const handleStartEdit = useCallback((message) => {
+    if (isGenerating || !message) return;
+    savedDraftRef.current = question;
+    const msgIndex = messages.findIndex((m) => m.id === message.id);
+    setEditingMessage({
+      ...message,
+      originalIndex: msgIndex
+    });
+    setQuestion(message.text || '');
+    const textarea = document.getElementById('composer-textarea');
+    if (textarea) {
+      textarea.focus();
+    }
+  }, [isGenerating, question, messages]);
+
+  // Cancel editing and restore previous draft
+  const handleCancelEdit = useCallback(() => {
+    setEditingMessage(null);
+    setQuestion(savedDraftRef.current || '');
+    savedDraftRef.current = '';
+  }, []);
+
+  // Resend edited user message with conversation branch consistency
+  const handleResendEditedMessage = async (targetMessage, newQuestionText) => {
+    const trimmed = newQuestionText.trim();
+    if (!trimmed || isGenerating) return;
+
+    // Locate the message to edit in the current message thread
+    const editIndex = messages.findIndex((m) => m.id === targetMessage.id);
+    if (editIndex === -1) {
+      setEditingMessage(null);
+      return;
+    }
+
+    const originalMsg = messages[editIndex];
+    const editedUserMessage = {
+      ...originalMsg,
+      text: trimmed,
+      isEdited: true,
+      editedAt: new Date()
+    };
+
+    // Correctness: replace the edited user message and remove subsequent obsolete assistant answer & turns
+    const truncatedHistory = [...messages.slice(0, editIndex), editedUserMessage];
+    setMessages(truncatedHistory);
+    setEditingMessage(null);
+    savedDraftRef.current = '';
+    setIsGenerating(true);
+    setGlobalError(null);
+
+    try {
+      const response = await askQuestion(trimmed);
+      const assistantMessage = {
+        id: `assistant-${Date.now()}`,
+        sender: 'assistant',
+        text: response.answer,
+        sources: response.sources || [],
+        insufficientEvidence: Boolean(response.insufficientEvidence),
+        timestamp: new Date()
+      };
+      setMessages((prev) => [...prev, assistantMessage]);
+      setQuestion('');
+    } catch (err) {
+      const errMsg = err.message || 'Unable to retrieve answer from document intelligence engine.';
+      const errorMessage = {
+        id: `error-${Date.now()}`,
+        sender: 'assistant',
+        text: `**Service Error:** ${errMsg}`,
+        isError: true,
+        originalQuestion: trimmed,
+        sources: [],
+        timestamp: new Date()
+      };
+      setMessages((prev) => [...prev, errorMessage]);
+      // Retain edited text in composer so user does not lose their modifications on API failure
+      setQuestion(trimmed);
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
   // Main Send handler (question + any pending attachments)
   const handleSend = async (questionText, attachments) => {
+    // If currently editing an existing message, resend through branch-consistent handler
+    if (editingMessage) {
+      await handleResendEditedMessage(editingMessage, questionText);
+      return;
+    }
+
     const hasFiles = attachments && attachments.length > 0;
     const hasQuestion = Boolean(questionText && questionText.trim());
 
@@ -392,6 +556,8 @@ export function App() {
     setMessages([]);
     setPendingAttachments([]);
     setQuestion('');
+    setEditingMessage(null);
+    savedDraftRef.current = '';
     setGlobalError(null);
   };
 
@@ -403,8 +569,9 @@ export function App() {
         onClose={() => setSidebarOpen(false)}
         uploadedDocuments={uploadedDocuments}
         isLoadingDocuments={isLoadingDocuments}
+        isRetryingDocuments={isRetryingDocuments}
         documentFetchError={documentFetchError}
-        onRetryFetchDocuments={loadDocuments}
+        onRetryFetchDocuments={() => loadDocuments(true)}
         onNewChat={handleNewChat}
         onTriggerUpload={handleTriggerUpload}
         onRemoveDocument={handleOpenRemoveModal}
@@ -457,6 +624,7 @@ export function App() {
             messages={messages}
             isGenerating={isGenerating}
             onRetry={handleRetryMessage}
+            onEdit={handleStartEdit}
             onSelectSuggestion={handleSelectSuggestion}
             hasDocuments={uploadedDocuments.length > 0}
             activeDocumentNames={activeDocumentNames}
@@ -475,6 +643,8 @@ export function App() {
             pendingAttachments={pendingAttachments}
             setPendingAttachments={setPendingAttachments}
             onRetryUpload={handleRetryUpload}
+            editingMessage={editingMessage}
+            onCancelEdit={handleCancelEdit}
           />
         </footer>
       </div>

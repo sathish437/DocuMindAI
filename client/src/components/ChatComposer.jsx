@@ -8,7 +8,8 @@ import {
   SpinnerIcon,
   CheckIcon,
   ExclamationIcon,
-  RefreshIcon
+  RefreshIcon,
+  EditIcon
 } from './Icons';
 import { MAX_FILE_SIZE_BYTES, MAX_FILE_COUNT, formatFileSize, isSupportedFileType } from '../api/apiClient';
 
@@ -21,7 +22,9 @@ export function ChatComposer({
   hasUploadedDocs,
   pendingAttachments,
   setPendingAttachments,
-  onRetryUpload
+  onRetryUpload,
+  editingMessage = null,
+  onCancelEdit = null
 }) {
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -35,6 +38,15 @@ export function ChatComposer({
     const newHeight = Math.min(textarea.scrollHeight, 180);
     textarea.style.height = `${Math.max(newHeight, 44)}px`;
   }, [question]);
+
+  // Focus and select end of text when editing an existing message
+  useEffect(() => {
+    if (editingMessage && textareaRef.current) {
+      textareaRef.current.focus();
+      const len = textareaRef.current.value.length;
+      textareaRef.current.setSelectionRange(len, len);
+    }
+  }, [editingMessage]);
 
   const handleOpenPicker = () => {
     if (isUploading || isGenerating) return;
@@ -107,6 +119,11 @@ export function ChatComposer({
   };
 
   const handleKeyDown = (e) => {
+    if (e.key === 'Escape' && editingMessage && onCancelEdit) {
+      e.preventDefault();
+      onCancelEdit();
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleTriggerSubmit();
@@ -142,6 +159,36 @@ export function ChatComposer({
           >
             <CloseIcon size={12} />
           </button>
+        </div>
+      )}
+
+      {/* Editing message indicator banner */}
+      {editingMessage && (
+        <div className="composer-editing-banner animate-fade-in" role="status">
+          <div className="editing-banner-content">
+            <span className="editing-banner-icon-badge">
+              <EditIcon size={14} />
+            </span>
+            <div className="editing-banner-text-group">
+              <span className="editing-banner-title">Editing message</span>
+              <span className="editing-banner-subtitle">
+                Make your changes and resend, or press <kbd>Esc</kbd> to cancel
+              </span>
+            </div>
+          </div>
+          {onCancelEdit && (
+            <button
+              type="button"
+              className="editing-cancel-action-btn"
+              onClick={onCancelEdit}
+              disabled={isBusy}
+              title="Cancel editing (Esc)"
+              aria-label="Cancel editing"
+            >
+              <CloseIcon size={13} />
+              <span>Cancel</span>
+            </button>
+          )}
         </div>
       )}
 
@@ -256,7 +303,9 @@ export function ChatComposer({
           onChange={(e) => setQuestion(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={
-            hasUploadedDocs
+            editingMessage
+              ? 'Modify your question...'
+              : hasUploadedDocs
               ? 'Ask anything about your documents... (English, Tanglish, தமிழ்)'
               : pendingAttachments.length > 0
               ? 'Add an optional question to ask upon upload...'
@@ -264,24 +313,46 @@ export function ChatComposer({
           }
           rows={1}
           disabled={isBusy}
-          aria-label="Ask a question about your documents"
+          aria-label={editingMessage ? 'Edit your question' : 'Ask a question about your documents'}
         />
 
-        {/* Send button */}
+        {/* Cancel button in input row when editing */}
+        {editingMessage && onCancelEdit && (
+          <button
+            type="button"
+            className="composer-cancel-edit-btn"
+            onClick={onCancelEdit}
+            disabled={isBusy}
+            title="Cancel editing (Esc)"
+            aria-label="Cancel editing"
+          >
+            Cancel
+          </button>
+        )}
+
+        {/* Send / Resend button */}
         <button
           type="button"
           id="composer-send-btn"
-          className={`composer-action-btn send-btn ${canSubmit ? 'can-send' : ''}`}
+          className={`composer-action-btn send-btn ${canSubmit ? 'can-send' : ''} ${editingMessage ? 'is-resend' : ''}`}
           onClick={handleTriggerSubmit}
           disabled={!canSubmit}
           title={
             isBusy
               ? 'Processing...'
+              : editingMessage
+              ? 'Save & Resend question (Enter)'
               : pendingAttachments.length > 0 && !question.trim()
               ? 'Upload attached documents'
               : 'Send message (Enter)'
           }
-          aria-label={isBusy ? 'Processing' : 'Send message'}
+          aria-label={
+            isBusy
+              ? 'Processing'
+              : editingMessage
+              ? 'Save and resend question'
+              : 'Send message'
+          }
         >
           {isBusy ? (
             <SpinnerIcon size={18} className="send-spinner" />
@@ -292,12 +363,25 @@ export function ChatComposer({
       </div>
 
       <div className="composer-footer-hints">
-        <span className="composer-hint-item">
-          <kbd>Enter</kbd> to send • <kbd>Shift</kbd> + <kbd>Enter</kbd> for new line
-        </span>
-        <span className="composer-hint-item hint-formats">
-          Supports PDF & DOCX up to 20MB
-        </span>
+        {editingMessage ? (
+          <>
+            <span className="composer-hint-item">
+              <kbd>Enter</kbd> to resend • <kbd>Esc</kbd> to cancel
+            </span>
+            <span className="composer-hint-item hint-formats">
+              Editing previous message
+            </span>
+          </>
+        ) : (
+          <>
+            <span className="composer-hint-item">
+              <kbd>Enter</kbd> to send • <kbd>Shift</kbd> + <kbd>Enter</kbd> for new line
+            </span>
+            <span className="composer-hint-item hint-formats">
+              Supports PDF & DOCX up to 20MB
+            </span>
+          </>
+        )}
       </div>
     </div>
   );
